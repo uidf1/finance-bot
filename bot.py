@@ -30,7 +30,6 @@ dp = Dispatcher(storage=MemoryStorage())
 DB_PATH = "/app/data/finance.db"
 
 async def init_db():
-    # создаем директорию и таблицу
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -54,7 +53,6 @@ class RecordState(StatesGroup):
 
 
 def main_kb():
-    # обновленная клавиатура с новыми фичами
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➖ Расход"), KeyboardButton(text="➕ Доход")],
@@ -78,7 +76,6 @@ def cancel_inline_kb():
 
 
 def reports_inline_kb():
-    # клавиатура выбора периода отчета
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="За текущую неделю", callback_data="report_week")],
@@ -87,9 +84,13 @@ def reports_inline_kb():
         ]
     )
 
+# ==========================================
+# 1. БАЗОВЫЕ КОМАНДЫ И ОТМЕНА
+# ==========================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "Привет! Я помогу вести учёт доходов и расходов.\nВыбери действие на клавиатуре снизу 👇",
         reply_markup=main_kb(),
@@ -103,85 +104,67 @@ async def cancel_handler(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(F.text.in_(["➖ Расход", "➕ Доход"]))
-async def start_record(message: types.Message, state: FSMContext):
-    trans_type = "expense" if message.text == "➖ Расход" else "income"
-    await state.update_data(trans_type=trans_type)
+@dp.callback_query(F.data.startswith("report_"))
+async def process_report_callback(callback: types.CallbackQuery):
+    period = callback.data.split("_")[1]
+    now = datetime.now()
+    user_id = callback.from_user.id
 
-    label = "расхода" if trans_type == "expense" else "дохода"
-    await message.answer(
-        f"Введи сумму {label} (можно добавить комментарий через пробел, например: `250 такси`):",
-        reply_markup=cancel_inline_kb(),
-        parse_mode="Markdown",
-    )
-    await state.set_state(RecordState.waiting_for_amount)
-
-
-@dp.message(RecordState.waiting_for_amount)
-async def process_amount(message: types.Message, state: FSMContext):
-    parts = message.text.split(maxsplit=1)
-    raw_amount = parts[0].replace(",", ".")
-
-    try:
-        amount = float(raw_amount)
-    except ValueError:
-        await message.answer("Введи число! Например: `500` или `500.50 кофе`")
+    if period == "week":
+        start_date = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+        period_label = "текущую неделю"
+    elif period == "month":
+        start_date = now.strftime("%Y-%m-01")
+        period_label = "текущий месяц"
+    elif period == "year":
+        start_date = now.strftime("%Y-01-01")
+        period_label = "текущий год"
+    else:
         return
 
-    description = parts[1] if len(parts) > 1 else ""
-    data = await state.get_data()
-    trans_type = data["trans_type"]
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO transactions (user_id, amount, trans_type, description, date) VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, amount, trans_type, description, today_str),
-        )
-        await db.commit()
+        async with db.execute(
+            "SELECT amount, trans_type, description FROM transactions WHERE user_id = ? AND date >= ? AND date <= ?",
+            (user_id, start_date, end_date),
+        ) as cursor:
+            rows = await cursor.fetchall()
 
-    icon = "🔴" if trans_type == "expense" else "🟢"
-    title = "Расход" if trans_type == "expense" else "Доход"
-    desc_str = f" ({description})" if description else ""
-
-    await message.answer(
-        f"{icon} **Записано!**\n{title}: {amount:.2f} руб.{desc_str}\nДата: {today_str}",
-        reply_markup=main_kb(),
-        parse_mode="Markdown",
-    )
-    await state.clear()
-
-
-@dp.message(F.text == "📊 Сверка за сегодня")
-async def stat_today(message: types.Message):
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    await send_stats_for_date(message.from_user.id, today_str, message)
-
-
-@dp.message(F.text == "📅 Сверка за дату")
-async def ask_custom_date(message: types.Message, state: FSMContext):
-    await message.answer(
-        "Введи дату в формате `ГГГГ-ММ-ДД` (например, `2026-11-09`):",
-        reply_markup=cancel_inline_kb(),
-        parse_mode="Markdown",
-    )
-    await state.set_state(RecordState.waiting_for_date_stat)
-
-
-@dp.message(RecordState.waiting_for_date_stat)
-async def process_custom_date(message: types.Message, state: FSMContext):
-    date_str = message.text.strip()
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
-        await message.answer(
-            "Неверный формат даты! Используй формат `ГГГГ-ММ-ДД`, например: `2026-11-09`"
-        )
+    if not rows:
+        await callback.message.edit_text(f"За {period_label} записей нет.")
         return
 
-    await send_stats_for_date(message.from_user.id, date_str, message)
-    await state.clear()
+    total_income = sum(r[0] for r in rows if r[1] == "income")
+    total_expense = sum(r[0] for r in rows if r[1] == "expense")
+    net_result = total_income - total_expense
 
+    expenses_dict = {}
+    for r in rows:
+        if r[1] == "expense" and r[2]:
+            desc = r[2].strip().capitalize()
+            expenses_dict[desc] = expenses_dict.get(desc, 0) + r[0]
+
+    top_expenses_text = ""
+    if expenses_dict:
+        sorted_exp = sorted(expenses_dict.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_expenses_text = "\n\n🔥 **Топ-3 категорий расходов:**\n"
+        for i, (desc, amount) in enumerate(sorted_exp, 1):
+            top_expenses_text += f"{i}. {desc}: {amount:.2f} руб.\n"
+
+    status = "🟩 Плюс" if net_result > 0 else ("🟥 Минус" if net_result < 0 else "🟦 Ноль")
+
+    text = (
+        f"📅 **Отчет за {period_label}:**\n"
+        f"С {start_date} по {end_date}\n\n"
+        f"➕ **Всего доходов:** {total_income:.2f} руб.\n"
+        f"➖ **Всего расходов:** {total_expense:.2f} руб.\n"
+        f"──────────────────\n"
+        f"Итог: {status} ({net_result:.2f} руб.){top_expenses_text}"
+    )
+
+    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.answer()
 
 async def send_stats_for_date(user_id: int, date_str: str, message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -227,84 +210,54 @@ async def send_stats_for_date(user_id: int, date_str: str, message: types.Messag
 
     await message.answer(text, parse_mode="Markdown", reply_markup=main_kb())
 
+# ==========================================
+# 2. ОБРАБОТЧИКИ КНОПОК МЕНЮ (ВСЕГДА СБРАСЫВАЮТ СОСТОЯНИЕ)
+# ==========================================
 
-# --- новые функции ниже ---
+@dp.message(F.text.in_(["➖ Расход", "➕ Доход"]))
+async def start_record(message: types.Message, state: FSMContext):
+    await state.clear() # Сбрасываем старые состояния перед новым
+    trans_type = "expense" if message.text == "➖ Расход" else "income"
+    await state.update_data(trans_type=trans_type)
+
+    label = "расхода" if trans_type == "expense" else "дохода"
+    await message.answer(
+        f"Введи сумму {label} (можно добавить комментарий через пробел, например: `250 такси`):",
+        reply_markup=cancel_inline_kb(),
+        parse_mode="Markdown",
+    )
+    await state.set_state(RecordState.waiting_for_amount)
+
+
+@dp.message(F.text == "📊 Сверка за сегодня")
+async def stat_today(message: types.Message, state: FSMContext):
+    await state.clear()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    await send_stats_for_date(message.from_user.id, today_str, message)
+
+
+@dp.message(F.text == "📅 Сверка за дату")
+async def ask_custom_date(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Введи дату в формате `ГГГГ-ММ-ДД` (например, `2026-11-09`):",
+        reply_markup=cancel_inline_kb(),
+        parse_mode="Markdown",
+    )
+    await state.set_state(RecordState.waiting_for_date_stat)
+
 
 @dp.message(F.text == "📈 Отчеты")
-async def show_reports_menu(message: types.Message):
+async def show_reports_menu(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer("Выбери период для отчета:", reply_markup=reports_inline_kb())
 
 
-@dp.callback_query(F.data.startswith("report_"))
-async def process_report_callback(callback: types.CallbackQuery):
-    period = callback.data.split("_")[1]
-    now = datetime.now()
-    user_id = callback.from_user.id
-
-    # вычисляем даты начала и конца периода
-    if period == "week":
-        start_date = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
-        period_label = "текущую неделю"
-    elif period == "month":
-        start_date = now.strftime("%Y-%m-01")
-        period_label = "текущий месяц"
-    elif period == "year":
-        start_date = now.strftime("%Y-01-01")
-        period_label = "текущий год"
-    else:
-        return
-
-    end_date = now.strftime("%Y-%m-%d")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT amount, trans_type, description FROM transactions WHERE user_id = ? AND date >= ? AND date <= ?",
-            (user_id, start_date, end_date),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-    if not rows:
-        await callback.message.edit_text(f"За {period_label} записей нет.")
-        return
-
-    total_income = sum(r[0] for r in rows if r[1] == "income")
-    total_expense = sum(r[0] for r in rows if r[1] == "expense")
-    net_result = total_income - total_expense
-
-    # анализируем топ категорий расходов по описанию
-    expenses_dict = {}
-    for r in rows:
-        if r[1] == "expense" and r[2]:
-            desc = r[2].strip().capitalize()
-            expenses_dict[desc] = expenses_dict.get(desc, 0) + r[0]
-
-    top_expenses_text = ""
-    if expenses_dict:
-        sorted_exp = sorted(expenses_dict.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_expenses_text = "\n\n🔥 **Топ-3 категорий расходов:**\n"
-        for i, (desc, amount) in enumerate(sorted_exp, 1):
-            top_expenses_text += f"{i}. {desc}: {amount:.2f} руб.\n"
-
-    status = "🟩 Плюс" if net_result > 0 else ("🟥 Минус" if net_result < 0 else "🟦 Ноль")
-
-    text = (
-        f"📅 **Отчет за {period_label}:**\n"
-        f"С {start_date} по {end_date}\n\n"
-        f"➕ **Всего доходов:** {total_income:.2f} руб.\n"
-        f"➖ **Всего расходов:** {total_expense:.2f} руб.\n"
-        f"──────────────────\n"
-        f"Итог: {status} ({net_result:.2f} руб.){top_expenses_text}"
-    )
-
-    await callback.message.edit_text(text, parse_mode="Markdown")
-    await callback.answer()
-
-
 @dp.message(F.text == "↩️ Отменить последнюю")
-async def undo_last_transaction(message: types.Message):
+async def undo_last_transaction(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
-        # находим последнюю транзакцию
         async with db.execute(
             "SELECT id, amount, trans_type, description FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT 1",
             (user_id,)
@@ -316,8 +269,6 @@ async def undo_last_transaction(message: types.Message):
             return
 
         trans_id, amount, trans_type, desc = row
-        
-        # удаляем запись
         await db.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
         await db.commit()
 
@@ -327,7 +278,8 @@ async def undo_last_transaction(message: types.Message):
 
 
 @dp.message(F.text == "📥 Скачать CSV")
-async def export_csv(message: types.Message):
+async def export_csv(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -340,7 +292,6 @@ async def export_csv(message: types.Message):
         await message.answer("В базе нет записей для выгрузки.")
         return
 
-    # генерируем csv в памяти
     output = io.StringIO()
     writer = csv.writer(output, delimiter=';')
     writer.writerow(['Дата', 'Тип', 'Сумма', 'Комментарий'])
@@ -350,10 +301,63 @@ async def export_csv(message: types.Message):
         t_type_ru = "Доход" if t_type == "income" else "Расход"
         writer.writerow([date, t_type_ru, amount, desc])
 
-    csv_bytes = output.getvalue().encode('utf-8-sig') # utf-8-sig для правильного отображения кириллицы в excel
+    csv_bytes = output.getvalue().encode('utf-8-sig')
     
     document = BufferedInputFile(csv_bytes, filename=f"finance_export_{datetime.now().strftime('%Y%m%d')}.csv")
     await message.answer_document(document, caption="📊 Твоя история транзакций.")
+
+# ==========================================
+# 3. ОБРАБОТЧИКИ СОСТОЯНИЙ (СТРОГО В КОНЦЕ!)
+# ==========================================
+
+@dp.message(RecordState.waiting_for_amount)
+async def process_amount(message: types.Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    raw_amount = parts[0].replace(",", ".")
+
+    try:
+        amount = float(raw_amount)
+    except ValueError:
+        await message.answer("Введи число! Например: `500` или `500.50 кофе`")
+        return
+
+    description = parts[1] if len(parts) > 1 else ""
+    data = await state.get_data()
+    trans_type = data["trans_type"]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO transactions (user_id, amount, trans_type, description, date) VALUES (?, ?, ?, ?, ?)",
+            (message.from_user.id, amount, trans_type, description, today_str),
+        )
+        await db.commit()
+
+    icon = "🔴" if trans_type == "expense" else "🟢"
+    title = "Расход" if trans_type == "expense" else "Доход"
+    desc_str = f" ({description})" if description else ""
+
+    await message.answer(
+        f"{icon} **Записано!**\n{title}: {amount:.2f} руб.{desc_str}\nДата: {today_str}",
+        reply_markup=main_kb(),
+        parse_mode="Markdown",
+    )
+    await state.clear()
+
+
+@dp.message(RecordState.waiting_for_date_stat)
+async def process_custom_date(message: types.Message, state: FSMContext):
+    date_str = message.text.strip()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        await message.answer(
+            "Неверный формат даты! Используй формат `ГГГГ-ММ-ДД`, например: `2026-11-09`"
+        )
+        return
+
+    await send_stats_for_date(message.from_user.id, date_str, message)
+    await state.clear()
 
 
 async def main():
